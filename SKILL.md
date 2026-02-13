@@ -1,6 +1,6 @@
 ---
 name: codex-account-switcher
-version: 1.2.0
+version: 1.2.1
 homepage: https://github.com/odrobnik/codex-account-switcher-skill
 description: >
   Manage multiple OpenAI Codex accounts. Capture current login tokens and switch
