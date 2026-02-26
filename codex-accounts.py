@@ -565,7 +565,7 @@ def _get_quota_for_account(name):
     # Ping codex to get fresh session
     try:
         subprocess.run(
-            ["codex", "-p", "PING"],
+            ["codex", "exec", "PING"],
             capture_output=True,
             timeout=30
         )
@@ -654,13 +654,16 @@ def cmd_auto(json_mode=False):
             
             # If quota has already reset, treat as 0% used
             effective_weekly_pct = 0 if now >= weekly_resets_at else weekly_pct
-            
+            weekly_available = 100 - effective_weekly_pct
+            daily_available = 100 - daily_pct
+
             results[name] = {
                 'weekly_used': weekly_pct,
                 'weekly_resets_at': weekly_resets_at,
                 'effective_weekly_used': effective_weekly_pct,
                 'daily_used': daily_pct,
-                'available': 100 - effective_weekly_pct
+                'weekly_available': weekly_available,
+                'daily_available': daily_available,
             }
             if not json_mode:
                 if effective_weekly_pct < weekly_pct:
@@ -672,27 +675,48 @@ def cmd_auto(json_mode=False):
             if not json_mode:
                 print("❌ failed")
     
-    # Find best account (lowest effective weekly usage, accounting for resets)
-    valid = {k: v for k, v in results.items() if 'available' in v}
-    
-    if not valid:
-        if original_account:
-            shutil.copy(ACCOUNTS_DIR / f"{original_account}.json", AUTH_FILE)
-        if json_mode:
-            print(json.dumps({"error": "No valid quota data", "results": results}))
-        else:
-            print("\n❌ Could not get quota for any account")
-        return
-    
-    # Sort by: 1) lowest effective usage, 2) earliest reset time (if both at 100%)
-    def sort_key(k):
-        v = valid[k]
-        effective = v['effective_weekly_used']
-        resets_at = v.get('weekly_resets_at', float('inf'))
-        # Return (effective_usage, resets_at) - lower is better
-        return (effective, resets_at)
-    
-    best = min(valid.keys(), key=sort_key)
+    # Prefer accounts that still have >1% daily and >1% weekly available.
+    # Among them, choose the one whose weekly quota resets the soonest,
+    # so we burn leftovers that are closest to refreshing.
+    eligible = {
+        k: v
+        for k, v in results.items()
+        if 'weekly_available' in v and v['daily_available'] > 1 and v['weekly_available'] > 1
+    }
+
+    if eligible:
+        def sort_key(k):
+            v = eligible[k]
+            resets_at = v.get('weekly_resets_at', float('inf'))
+            weekly_available = v.get('weekly_available', 0)
+            daily_available = v.get('daily_available', 0)
+            return (resets_at, weekly_available, daily_available)
+
+        best = min(eligible.keys(), key=sort_key)
+        selected_pool = eligible
+    else:
+        # Fallback: if nothing matches the >1% / >1% rule,
+        # still prefer the account whose weekly quota resets the soonest.
+        fallback = {k: v for k, v in results.items() if 'weekly_available' in v}
+
+        if not fallback:
+            if original_account:
+                shutil.copy(ACCOUNTS_DIR / f"{original_account}.json", AUTH_FILE)
+            if json_mode:
+                print(json.dumps({"error": "No valid quota data", "results": results}))
+            else:
+                print("\n❌ Could not get quota for any account")
+            return
+
+        def fallback_sort_key(k):
+            v = fallback[k]
+            resets_at = v.get('weekly_resets_at', float('inf'))
+            weekly_available = v.get('weekly_available', 0)
+            daily_available = v.get('daily_available', 0)
+            return (resets_at, weekly_available, daily_available)
+
+        best = min(fallback.keys(), key=fallback_sort_key)
+        selected_pool = fallback
     
     # Check if already on best account
     already_active = (original_account == best)
@@ -705,10 +729,12 @@ def cmd_auto(json_mode=False):
         print(json.dumps({
             "switched_to": best,
             "already_active": already_active,
-            "weekly_used": valid[best]['weekly_used'],
-            "effective_weekly_used": valid[best]['effective_weekly_used'],
-            "weekly_resets_at": valid[best].get('weekly_resets_at'),
-            "available": valid[best]['available'],
+            "weekly_used": results[best]['weekly_used'],
+            "effective_weekly_used": results[best]['effective_weekly_used'],
+            "weekly_resets_at": results[best].get('weekly_resets_at'),
+            "weekly_available": results[best]['weekly_available'],
+            "daily_available": results[best]['daily_available'],
+            "selection_pool": "eligible" if best in eligible else "fallback",
             "all_accounts": results
         }, indent=2))
     else:
@@ -717,13 +743,17 @@ def cmd_auto(json_mode=False):
             print(f"\n✅ Already on best account: {best}")
         else:
             print(f"\n✅ Switched to: {best}")
-        
-        effective = valid[best]['effective_weekly_used']
-        actual = valid[best]['weekly_used']
+
+        effective = results[best]['effective_weekly_used']
+        actual = results[best]['weekly_used']
         if effective < actual:
             print(f"   Weekly quota: RESET (was {actual:.0f}%, now fresh)")
         else:
-            print(f"   Weekly quota: {actual:.0f}% used ({valid[best]['available']:.0f}% available)")
+            print(
+                f"   Weekly quota: {actual:.0f}% used "
+                f"({results[best]['weekly_available']:.0f}% weekly available, "
+                f"{results[best]['daily_available']:.0f}% daily available)"
+            )
         
         # Show comparison
         print(f"\nAll accounts:")
