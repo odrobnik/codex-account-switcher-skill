@@ -104,6 +104,8 @@ def resolve_active_profile():
         return None
 
     for f in ACCOUNTS_DIR.glob("*.json"):
+        if f.name.startswith('.'):
+            continue
         if is_current(f):
             info = get_account_info(f) or {}
             return f.stem, info.get("email", "unknown")
@@ -202,6 +204,8 @@ def cmd_list(verbose: bool = False, json_mode: bool = False):
     max_name = 0
 
     for f in sorted(ACCOUNTS_DIR.glob("*.json")):
+        if f.name.startswith('.'):
+            continue
         name = f.stem
         max_name = max(max_name, len(name))
         active = is_current(f)
@@ -288,6 +292,8 @@ def _resolve_matching_account_by_email(email: str) -> Path | None:
 
     matches: list[Path] = []
     for f in ACCOUNTS_DIR.glob("*.json"):
+        if f.name.startswith('.'):
+            continue
         info = get_account_info(f) or {}
         got = (info.get("email") or "").strip().lower()
         if got and got == want:
@@ -531,7 +537,14 @@ def _save_quota_cache(name, limits):
         pass
 
 def _load_quota_cache(name, max_age_hours=24):
-    """Load quota from cache if fresh enough."""
+    """Load quota from cache if fresh enough.
+
+    Supports both legacy formats:
+    - { rate_limits: ..., cached_at: <epoch> }
+    - { rate_limits: ..., collected_at: <epoch> }
+
+    If neither timestamp exists, we fall back to the file mtime.
+    """
     import time
     cache_file = _get_quota_cache_file(name)
     if not cache_file.exists():
@@ -539,10 +552,14 @@ def _load_quota_cache(name, max_age_hours=24):
     try:
         with open(cache_file, 'r') as f:
             data = json.load(f)
-        cached_at = data.get('cached_at', 0)
-        if time.time() - cached_at < max_age_hours * 3600:
+
+        cached_at = data.get('cached_at') or data.get('collected_at')
+        if not isinstance(cached_at, (int, float)):
+            cached_at = cache_file.stat().st_mtime
+
+        if time.time() - float(cached_at) < max_age_hours * 3600:
             return data.get('rate_limits')
-    except:
+    except Exception:
         pass
     return None
 
@@ -562,12 +579,14 @@ def _get_quota_for_account(name):
     # Record time before ping to only look at sessions created after
     before_ping = time.time()
     
-    # Ping codex to get fresh session
+    # Ping codex to get a fresh session (for rate limit info)
+    # Note: `-p` is *profile*, not prompt. Use `codex exec` like codex-quota.
     try:
         subprocess.run(
-            ["codex", "-p", "PING"],
+            ["codex", "exec", "--skip-git-repo-check", "reply OK"],
+            cwd=str(CODEX_DIR),
             capture_output=True,
-            timeout=30
+            timeout=60,
         )
     except Exception:
         pass
@@ -632,6 +651,8 @@ def cmd_auto(json_mode=False):
     original_account = None
     if AUTH_FILE.exists():
         for acct_file in ACCOUNTS_DIR.glob("*.json"):
+            if acct_file.name.startswith('.'):
+                continue
             if acct_file.read_bytes() == AUTH_FILE.read_bytes():
                 original_account = acct_file.stem
                 break
@@ -751,6 +772,8 @@ def cmd_use(name):
         print(f"❌ Account '{name}' not found.")
         print("Available accounts:")
         for f in ACCOUNTS_DIR.glob("*.json"):
+            if f.name.startswith('.'):
+                continue
             print(f" - {f.stem}")
         return
     
