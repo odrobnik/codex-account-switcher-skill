@@ -14,6 +14,9 @@ from pathlib import Path
 CODEX_DIR = Path.home() / ".codex"
 AUTH_FILE = CODEX_DIR / "auth.json"
 ACCOUNTS_DIR = CODEX_DIR / "accounts"
+OPENCLAW_AUTH_PROFILES_FILE = (
+    Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+)
 
 def ensure_dirs():
     if not ACCOUNTS_DIR.exists():
@@ -34,6 +37,105 @@ def decode_jwt_payload(token):
         return json.loads(decoded)
     except Exception:
         return {}
+
+
+def decode_jwt_segment(segment):
+    try:
+        segment += '=' * (-len(segment) % 4)
+        decoded = base64.urlsafe_b64decode(segment)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def decode_jwt(token):
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {}
+
+        return {
+            "header": decode_jwt_segment(parts[0]),
+            "payload": decode_jwt_segment(parts[1]),
+        }
+    except Exception:
+        return {}
+
+
+def _normalize_str(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _get_tokens(data: dict) -> dict:
+    tokens = data.get("tokens", {}) if isinstance(data, dict) else {}
+    return tokens if isinstance(tokens, dict) else {}
+
+
+def _read_access_token_auth_claims(data: dict) -> dict:
+    access_token = _get_tokens(data).get("access_token")
+    if not isinstance(access_token, str) or access_token.count(".") != 2:
+        return {}
+
+    payload = decode_jwt_payload(access_token)
+    auth = payload.get("https://api.openai.com/auth")
+    return auth if isinstance(auth, dict) else {}
+
+
+def _read_access_token_profile_claims(data: dict) -> dict:
+    access_token = _get_tokens(data).get("access_token")
+    if not isinstance(access_token, str) or access_token.count(".") != 2:
+        return {}
+
+    payload = decode_jwt_payload(access_token)
+    profile = payload.get("https://api.openai.com/profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def _read_codex_account_id(data: dict) -> str | None:
+    auth = _read_access_token_auth_claims(data)
+    account_id = _normalize_str(auth.get("chatgpt_account_id"))
+    if account_id:
+        return account_id
+    return _normalize_str(data.get("account_id"))
+
+
+def _read_codex_user_id(data: dict) -> str | None:
+    auth = _read_access_token_auth_claims(data)
+    return (
+        _normalize_str(auth.get("user_id"))
+        or _normalize_str(auth.get("chatgpt_user_id"))
+        or _normalize_str(auth.get("chatgpt_account_user_id"))
+    )
+
+
+def _suggested_account_name(email: str | None, user_id: str | None) -> str:
+    if isinstance(email, str) and "@" in email:
+        suggested = email.split("@", 1)[0].strip()
+        if suggested:
+            return suggested
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    return "account"
+
+
+def _describe_identity(info: dict | None) -> str:
+    info = info or {}
+    user_id = _normalize_str(info.get("user_id"))
+    email = _normalize_str(info.get("email"))
+    account_id = _normalize_str(info.get("account_id"))
+
+    if user_id and email and email not in ("unknown", "error"):
+        return f"{user_id} ({email})"
+    if user_id:
+        return user_id
+    if email and email not in ("unknown", "error"):
+        return email
+    if account_id:
+        return f"account_id {account_id}"
+    return "unknown"
 
 def _read_token_exp_seconds(data: dict) -> int | None:
     """Try to extract an expiry timestamp (unix seconds) from known JWT fields.
@@ -59,7 +161,7 @@ def _read_token_exp_seconds(data: dict) -> int | None:
 
 
 def get_account_info(auth_path):
-    """Return email and other info from an auth.json file."""
+    """Return token-derived identity and diagnostics from an auth.json file."""
     if not auth_path.exists():
         return None
 
@@ -69,23 +171,32 @@ def get_account_info(auth_path):
 
         exp = _read_token_exp_seconds(data)
         last_refresh = data.get('last_refresh') if isinstance(data, dict) else None
+        account_id = _read_codex_account_id(data)
+        user_id = _read_codex_user_id(data)
 
-        # Look for id_token in tokens object
-        tokens = data.get('tokens', {})
+        # Prefer id_token for human-readable identity, then fall back to access token profile claims.
+        tokens = _get_tokens(data)
         id_token = tokens.get('id_token')
+        email = 'unknown'
+        name = None
 
-        if id_token:
+        if isinstance(id_token, str) and id_token.count('.') == 2:
             payload = decode_jwt_payload(id_token)
-            return {
-                'email': payload.get('email', 'unknown'),
-                'name': payload.get('name'),
-                'exp': exp,
-                'last_refresh': last_refresh,
-                'raw': data
-            }
+            email = payload.get('email', email)
+            name = payload.get('name')
+        else:
+            profile = _read_access_token_profile_claims(data)
+            email = profile.get('email', email)
 
-        # Fallback if structure is different
-        return {'email': 'unknown', 'exp': exp, 'last_refresh': last_refresh, 'raw': data}
+        return {
+            'email': email,
+            'name': name,
+            'account_id': account_id,
+            'user_id': user_id,
+            'exp': exp,
+            'last_refresh': last_refresh,
+            'raw': data
+        }
     except Exception as e:
         return {'email': 'error', 'error': str(e)}
 
@@ -98,14 +209,95 @@ def is_current(stored_path):
     with open(AUTH_FILE, 'rb') as f1, open(stored_path, 'rb') as f2:
         return f1.read() == f2.read()
 
+
+# --- Account Activity Logging ---
+# Tracks which account (user_id) is active at what time, enabling
+# accurate attribution of sessions to accounts.
+
+ACTIVITY_LOG = CODEX_DIR / "account-activity.jsonl"
+
+
+def get_user_id_from_auth(auth_path=None):
+    """Extract user_id from an auth.json file's JWT token."""
+    if auth_path is None:
+        auth_path = AUTH_FILE
+    if not auth_path.exists():
+        return None
+    
+    try:
+        with open(auth_path, 'r') as f:
+            data = json.load(f)
+
+        return _read_codex_user_id(data)
+    except Exception:
+        return None
+
+
+def log_account_switch(account_name, user_id=None):
+    """Log an account switch to the activity log.
+    
+    This enables matching sessions to accounts by timestamp.
+    """
+    import time
+    
+    if user_id is None:
+        user_id = get_user_id_from_auth()
+    
+    if not user_id:
+        return  # Can't log without user_id
+    
+    entry = {
+        "timestamp": int(time.time()),
+        "account": account_name,
+        "user_id": user_id
+    }
+    
+    try:
+        with open(ACTIVITY_LOG, 'a') as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Non-critical, don't fail the switch
+
+
+def get_account_for_timestamp(ts):
+    """Look up which account was active at a given timestamp.
+    
+    Returns (account_name, user_id) or (None, None) if unknown.
+    """
+    if not ACTIVITY_LOG.exists():
+        return None, None
+    
+    try:
+        entries = []
+        with open(ACTIVITY_LOG, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+        
+        # Sort by timestamp descending
+        entries.sort(key=lambda e: e.get('timestamp', 0), reverse=True)
+        
+        # Find the first entry with timestamp <= ts
+        for entry in entries:
+            if entry.get('timestamp', 0) <= ts:
+                return entry.get('account'), entry.get('user_id')
+        
+        # If ts is before all entries, use the earliest entry
+        if entries:
+            earliest = min(entries, key=lambda e: e.get('timestamp', float('inf')))
+            return earliest.get('account'), earliest.get('user_id')
+        
+        return None, None
+    except Exception:
+        return None, None
+
 def resolve_active_profile():
     """Return (name, email) for the currently active auth.json if it matches a saved profile."""
     if not AUTH_FILE.exists():
         return None
 
-    for f in ACCOUNTS_DIR.glob("*.json"):
-        if f.name.startswith('.'):
-            continue
+    for f in _iter_account_snapshot_files():
         if is_current(f):
             info = get_account_info(f) or {}
             return f.stem, info.get("email", "unknown")
@@ -203,9 +395,7 @@ def cmd_list(verbose: bool = False, json_mode: bool = False):
     accounts = []
     max_name = 0
 
-    for f in sorted(ACCOUNTS_DIR.glob("*.json")):
-        if f.name.startswith('.'):
-            continue
+    for f in _iter_account_snapshot_files():
         name = f.stem
         max_name = max(max_name, len(name))
         active = is_current(f)
@@ -291,9 +481,7 @@ def _resolve_matching_account_by_email(email: str) -> Path | None:
         return None
 
     matches: list[Path] = []
-    for f in ACCOUNTS_DIR.glob("*.json"):
-        if f.name.startswith('.'):
-            continue
+    for f in _iter_account_snapshot_files():
         info = get_account_info(f) or {}
         got = (info.get("email") or "").strip().lower()
         if got and got == want:
@@ -311,6 +499,57 @@ def _resolve_matching_account_by_email(email: str) -> Path | None:
     return matches[0]
 
 
+def _resolve_matching_account_by_user_id(user_id: str) -> Path | None:
+    """Find an existing saved account file whose token-derived user_id matches."""
+    want = _normalize_str(user_id)
+    if not want:
+        return None
+
+    matches: list[Path] = []
+    for f in _iter_account_snapshot_files():
+        info = get_account_info(f) or {}
+        got = _normalize_str(info.get("user_id"))
+        if got and got == want:
+            matches.append(f)
+
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    return sorted(matches)[0]
+
+
+def _resolve_matching_account_by_account_id(account_id: str) -> Path | None:
+    """Find a saved account file by accountId only when that match is unique."""
+    want = _normalize_str(account_id)
+    if not want:
+        return None
+
+    matches: list[Path] = []
+    for f in _iter_account_snapshot_files():
+        info = get_account_info(f) or {}
+        got = _normalize_str(info.get("account_id"))
+        if got and got == want:
+            matches.append(f)
+
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _resolve_matching_account(account_id: str | None, user_id: str | None, email: str | None) -> Path | None:
+    """Find the best matching saved account using token-derived identity first."""
+    match = _resolve_matching_account_by_user_id(user_id or "")
+    if match is not None:
+        return match
+
+    match = _resolve_matching_account_by_email(email or "")
+    if match is not None:
+        return match
+
+    return _resolve_matching_account_by_account_id(account_id or "")
+
+
 def _resolve_unique_name_path(base_name: str) -> tuple[str, Path]:
     base = (base_name or "account").strip() or "account"
     target = ACCOUNTS_DIR / f"{base}.json"
@@ -326,14 +565,23 @@ def _resolve_unique_name_path(base_name: str) -> tuple[str, Path]:
         suffix += 1
 
 
+def _iter_account_snapshot_files():
+    for path in sorted(ACCOUNTS_DIR.glob("*.json")):
+        if path.name.startswith('.'):
+            continue
+        if path.name.endswith(".debug.json"):
+            continue
+        yield path
+
+
 def cmd_add(name_override: str | None = None):
     """Add accounts by ALWAYS running a fresh login flow.
 
     Behavior:
     - Always triggers a new browser login.
-    - After login, detects the email from ~/.codex/auth.json.
-    - If we already have a saved account with that SAME email: update that file.
-    - Otherwise: save a new file named from the email local-part (or --name).
+    - After login, detects token identity from ~/.codex/auth.json.
+    - If we already have a saved account with that SAME token identity: update that file.
+    - Otherwise: save a new file named from the email local-part, or userId when email is unavailable.
 
     Interactive (TTY): can repeat.
     Non-interactive (Clawdbot): single-shot.
@@ -356,31 +604,32 @@ def cmd_add(name_override: str | None = None):
 
         info = get_account_info(AUTH_FILE) or {}
         email = info.get('email', 'unknown')
+        account_id = info.get("account_id")
+        user_id = info.get("user_id")
+        identity_label = _describe_identity(info)
         current_email = (email or '').strip().lower() if isinstance(email, str) else ''
-        print(f"Found active session for: {email}")
+        print(f"Found active session for: {identity_label}")
 
-        suggested = (
-            email.split('@', 1)[0]
-            if isinstance(email, str) and '@' in email
-            else "account"
-        ).strip() or "account"
+        suggested = _suggested_account_name(email, user_id)
 
         # 1) If we already have this identity stored under ANY name, update that file.
-        match = _resolve_matching_account_by_email(current_email)
+        match = _resolve_matching_account(account_id, user_id, current_email)
         if match is not None:
             # Only overwrite if different.
             if is_current(match):
-                print(f"ℹ️  '{match.stem}' already up to date for {current_email}")
+                print(f"ℹ️  '{match.stem}' already up to date for {identity_label}")
             else:
-                print(f"ℹ️  Updating existing account '{match.stem}' ({current_email})")
-                shutil.copy2(AUTH_FILE, match)
-            print(f"✅ Saved '{match.stem}' ({email})")
+                print(f"ℹ️  Updating existing account '{match.stem}' ({identity_label})")
+                safe_save_token(AUTH_FILE, match, force=False)
+            print(f"✅ Saved '{match.stem}' ({identity_label})")
+            sync_to_openclaw(match.stem, match)
         else:
             # 2) Otherwise, create a new snapshot with default (or override) name.
             base_name = (name_override or suggested).strip() or suggested
             name, target = _resolve_unique_name_path(base_name)
-            shutil.copy2(AUTH_FILE, target)
-            print(f"✅ Saved '{name}' ({email})")
+            safe_save_token(AUTH_FILE, target, force=False)
+            print(f"✅ Saved '{name}' ({identity_label})")
+            sync_to_openclaw(name, target)
 
         if not interactive:
             return
@@ -567,6 +816,7 @@ def _get_quota_for_account(name):
     """Get quota info for an account by switching to it and pinging Codex."""
     import subprocess
     import time
+    import re
     from datetime import datetime
     
     source = ACCOUNTS_DIR / f"{name}.json"
@@ -575,57 +825,59 @@ def _get_quota_for_account(name):
     
     # Switch to account
     shutil.copy(source, AUTH_FILE)
-    
-    # Record time before ping to only look at sessions created after
-    before_ping = time.time()
+    user_id = get_user_id_from_auth(source)
+    log_account_switch(name, user_id)
     
     # Ping codex to get a fresh session (for rate limit info)
-    # Note: `-p` is *profile*, not prompt. Use `codex exec` like codex-quota.
+    session_id = None
     try:
-        subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check", "reply OK"],
+        result = subprocess.run(
+            [
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                f'Quota-Probe for\n\n```json\n{{"user_id": "{user_id or ""}"}}\n```\n\nOnly reply `OK`',
+            ],
             cwd=str(CODEX_DIR),
             capture_output=True,
+            text=True,
             timeout=60,
         )
+        match = re.search(r'session id:\s+([a-f0-9\-]+)', result.stderr)
+        if match:
+            session_id = match.group(1)
     except Exception:
         pass
     
-    time.sleep(0.5)
+    time.sleep(1)
     
-    # Find sessions created AFTER our ping and extract rate limits
-    sessions_dir = CODEX_DIR / "sessions"
-    now = datetime.now()
-    
-    for day_offset in range(2):
-        date = datetime.fromordinal(now.toordinal() - day_offset)
-        day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
+    if session_id:
+        sessions_dir = CODEX_DIR / "sessions"
+        now = datetime.now()
         
-        if not day_dir.exists():
-            continue
-        
-        # Only consider sessions created after our ping
-        jsonl_files = [f for f in day_dir.glob("*.jsonl") if f.stat().st_mtime > before_ping]
-        if not jsonl_files:
-            continue
+        for day_offset in range(2):
+            date = datetime.fromordinal(now.toordinal() - day_offset)
+            day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
             
-        # Check each new session for rate_limits
-        for session_file in sorted(jsonl_files, key=lambda f: f.stat().st_mtime, reverse=True):
-            with open(session_file, 'r') as f:
-                lines = f.readlines()
-            
-            for line in reversed(lines):
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                    if (event.get('payload', {}).get('type') == 'token_count' and
-                        event.get('payload', {}).get('rate_limits')):
-                        limits = event['payload']['rate_limits']
-                        _save_quota_cache(name, limits)
-                        return limits
-                except json.JSONDecodeError:
-                    continue
+            if not day_dir.exists():
+                continue
+                
+            for session_file in day_dir.glob(f"*{session_id}.jsonl"):
+                with open(session_file, 'r') as f:
+                    lines = f.readlines()
+                
+                for line in reversed(lines):
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                        if (event.get('payload', {}).get('type') == 'token_count' and
+                            event.get('payload', {}).get('rate_limits')):
+                            limits = event['payload']['rate_limits']
+                            _save_quota_cache(name, limits)
+                            return limits
+                    except json.JSONDecodeError:
+                        continue
     
     # No fresh rate_limits - try cached data
     cached = _load_quota_cache(name)
@@ -634,12 +886,113 @@ def _get_quota_for_account(name):
     
     return None
 
+
+def _normalize_rate_limit_bucket(bucket) -> dict | None:
+    return bucket if isinstance(bucket, dict) else None
+
+
+def _quota_summary(limits: dict) -> dict | None:
+    if not isinstance(limits, dict):
+        return None
+
+    primary = _normalize_rate_limit_bucket(limits.get("primary"))
+    secondary = _normalize_rate_limit_bucket(limits.get("secondary"))
+
+    quota_bucket = secondary or primary
+    if quota_bucket is None:
+        return None
+
+    used_percent = quota_bucket.get("used_percent")
+    resets_at = quota_bucket.get("resets_at", 0)
+    daily_used = primary.get("used_percent") if primary else None
+
+    if not isinstance(used_percent, (int, float)):
+        return None
+    if daily_used is not None and not isinstance(daily_used, (int, float)):
+        daily_used = None
+    if not isinstance(resets_at, (int, float)):
+        resets_at = 0
+
+    return {
+        "used_percent": float(used_percent),
+        "daily_used": float(daily_used) if daily_used is not None else None,
+        "resets_at": int(resets_at),
+        "source": "secondary" if secondary else "primary",
+    }
+
+
+def cmd_sync():
+    """Sync all saved Codex snapshots into OpenClaw auth profiles."""
+    ensure_dirs()
+    sync_saved_openclaw_profiles()
+    print("✅ Synced saved accounts to OpenClaw auth-profiles.json")
+
+
+def cmd_compare(name_a: str, name_b: str, json_mode: bool = False):
+    path_a = ACCOUNTS_DIR / f"{name_a}.json"
+    path_b = ACCOUNTS_DIR / f"{name_b}.json"
+
+    if not path_a.exists():
+        print(f"❌ Account snapshot not found for '{name_a}': {path_a}")
+        return
+    if not path_b.exists():
+        print(f"❌ Account snapshot not found for '{name_b}': {path_b}")
+        return
+
+    with open(path_a, "r") as f:
+        a = json.load(f)
+    with open(path_b, "r") as f:
+        b = json.load(f)
+
+    decoded_a = a.get("decoded_tokens") or _build_decoded_token_fields(a)
+    decoded_b = b.get("decoded_tokens") or _build_decoded_token_fields(b)
+
+    flat_a = _flatten_json(decoded_a)
+    flat_b = _flatten_json(decoded_b)
+    all_keys = sorted(set(flat_a) | set(flat_b))
+
+    diffs = []
+    for key in all_keys:
+        val_a = flat_a.get(key)
+        val_b = flat_b.get(key)
+        if val_a != val_b:
+            diffs.append({
+                "field": key,
+                name_a: val_a,
+                name_b: val_b,
+            })
+
+    result = {
+        "left": name_a,
+        "right": name_b,
+        "left_file": str(path_a),
+        "right_file": str(path_b),
+        "diff_count": len(diffs),
+        "diffs": diffs,
+    }
+
+    if json_mode:
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"Comparing {name_a} vs {name_b}")
+    print(f"Left:  {path_a}")
+    print(f"Right: {path_b}")
+    print(f"Differences: {len(diffs)}")
+    if not diffs:
+        return
+
+    for diff in diffs:
+        print(f"\n{diff['field']}")
+        print(f"  {name_a}: {json.dumps(diff[name_a], ensure_ascii=False)}")
+        print(f"  {name_b}: {json.dumps(diff[name_b], ensure_ascii=False)}")
+
 def cmd_auto(json_mode=False):
     """Switch to the account with the most quota available."""
     import time
     ensure_dirs()
     
-    accounts = [f.stem for f in ACCOUNTS_DIR.glob("*.json") if not f.name.startswith('.')]
+    accounts = [f.stem for f in _iter_account_snapshot_files()]
     if not accounts:
         if json_mode:
             print('{"error": "No accounts found"}')
@@ -650,9 +1003,7 @@ def cmd_auto(json_mode=False):
     # Save current account to restore if needed
     original_account = None
     if AUTH_FILE.exists():
-        for acct_file in ACCOUNTS_DIR.glob("*.json"):
-            if acct_file.name.startswith('.'):
-                continue
+        for acct_file in _iter_account_snapshot_files():
             if acct_file.read_bytes() == AUTH_FILE.read_bytes():
                 original_account = acct_file.stem
                 break
@@ -667,11 +1018,12 @@ def cmd_auto(json_mode=False):
             print(f"  → {name}...", end=" ", flush=True)
         
         limits = _get_quota_for_account(name)
+        quota = _quota_summary(limits)
         
-        if limits:
-            weekly_pct = limits['secondary']['used_percent']
-            daily_pct = limits['primary']['used_percent']
-            weekly_resets_at = limits['secondary'].get('resets_at', 0)
+        if quota:
+            weekly_pct = quota['used_percent']
+            daily_pct = quota['daily_used']
+            weekly_resets_at = quota['resets_at']
             
             # If quota has already reset, treat as 0% used
             effective_weekly_pct = 0 if now >= weekly_resets_at else weekly_pct
@@ -681,7 +1033,8 @@ def cmd_auto(json_mode=False):
                 'weekly_resets_at': weekly_resets_at,
                 'effective_weekly_used': effective_weekly_pct,
                 'daily_used': daily_pct,
-                'available': 100 - effective_weekly_pct
+                'available': 100 - effective_weekly_pct,
+                'quota_source': quota['source'],
             }
             if not json_mode:
                 if effective_weekly_pct < weekly_pct:
@@ -721,6 +1074,9 @@ def cmd_auto(json_mode=False):
     # Only switch if not already active
     if not already_active:
         shutil.copy(ACCOUNTS_DIR / f"{best}.json", AUTH_FILE)
+        log_account_switch(best, get_user_id_from_auth(ACCOUNTS_DIR / f"{best}.json"))
+    
+    sync_to_openclaw(best, ACCOUNTS_DIR / f"{best}.json")
     
     if json_mode:
         print(json.dumps({
@@ -771,9 +1127,7 @@ def cmd_use(name):
     if not source.exists():
         print(f"❌ Account '{name}' not found.")
         print("Available accounts:")
-        for f in ACCOUNTS_DIR.glob("*.json"):
-            if f.name.startswith('.'):
-                continue
+        for f in _iter_account_snapshot_files():
             print(f" - {f.stem}")
         return
     
@@ -781,8 +1135,80 @@ def cmd_use(name):
     # Maybe risky to overwrite silently, but that's what a switcher does.
     
     shutil.copy2(source, AUTH_FILE)
+    log_account_switch(name, get_user_id_from_auth(source))
     info = get_account_info(source)
-    print(f"✅ Switched to account: {name} ({info.get('email')})")
+    print(f"✅ Switched to account: {name} ({_describe_identity(info)})")
+    
+    # Sync token to OpenClaw
+    sync_to_openclaw(name, source)
+
+def sync_to_openclaw(name, source_path, quiet: bool = False):
+    try:
+        with open(source_path, "r") as f:
+            data = json.load(f)
+            
+        tokens = _get_tokens(data)
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        id_token = tokens.get("id_token")
+        account_id = _read_codex_account_id(data) or ""
+        
+        if not access_token or not refresh_token:
+            return
+            
+        expires = 0
+        if id_token and "." in id_token:
+            try:
+                payload = id_token.split(".")[1]
+                payload += '=' * (-len(payload) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(payload))
+                expires = int(decoded.get("exp", 0)) * 1000
+            except:
+                pass
+                
+        # Target path inside OpenClaw
+        oc_path = OPENCLAW_AUTH_PROFILES_FILE
+        if not oc_path.exists():
+            return
+            
+        with open(oc_path, "r") as f:
+            oc_data = json.load(f)
+            
+        if "profiles" not in oc_data:
+            oc_data["profiles"] = {}
+            
+        profile_id = f"openai-codex:{name}"
+        
+        oc_data["profiles"][profile_id] = {
+            "type": "oauth",
+            "provider": "openai-codex",
+            "access": access_token,
+            "refresh": refresh_token,
+            "expires": expires,
+            "accountId": account_id
+        }
+        
+        with open(oc_path, "w") as f:
+            json.dump(oc_data, f, indent=2)
+            
+        # Also notify gateway to reload? We can just restart gateway, or let the user do it
+        # Actually, OpenClaw re-reads the file lazily on request in most cases, 
+        # but a gateway restart might be needed depending on the agent runtime
+        
+        if not quiet:
+            print(f"✅ Synced {name} token to OpenClaw auth-profiles.json (main agent)", file=sys.stderr)
+    except Exception as e:
+        if not quiet:
+            print(f"⚠️ Failed to sync to OpenClaw: {e}", file=sys.stderr)
+
+
+def sync_saved_openclaw_profiles() -> None:
+    """Ensure every saved Codex snapshot is mirrored to an OpenClaw profile."""
+    try:
+        for account_file in _iter_account_snapshot_files():
+            sync_to_openclaw(account_file.stem, account_file, quiet=True)
+    except Exception:
+        return
 
 def get_token_email(auth_path) -> str:
     """Extract email from a token file."""
@@ -790,30 +1216,96 @@ def get_token_email(auth_path) -> str:
     return (info.get("email") or "").strip().lower()
 
 
+def _build_decoded_token_fields(data: dict) -> dict:
+    tokens = _get_tokens(data)
+    decoded = {}
+    for key in ("id_token", "access_token", "refresh_token"):
+        token = tokens.get(key)
+        if isinstance(token, str) and token.count(".") == 2:
+            decoded[key] = decode_jwt(token)
+    return decoded
+
+
+def _annotate_snapshot_file(path: Path) -> None:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return
+
+        data["decoded_tokens"] = _build_decoded_token_fields(data)
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except Exception:
+        return
+
+
+def _flatten_json(value, prefix="") -> dict[str, object]:
+    items: dict[str, object] = {}
+    if isinstance(value, dict):
+        for key in sorted(value):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            items.update(_flatten_json(value[key], child_prefix))
+        return items
+    if isinstance(value, list):
+        if not value:
+            items[prefix] = []
+            return items
+        for idx, item in enumerate(value):
+            child_prefix = f"{prefix}[{idx}]"
+            items.update(_flatten_json(item, child_prefix))
+        return items
+    items[prefix] = value
+    return items
+
+
 def safe_save_token(source_path: Path, target_path: Path, force: bool = False) -> tuple[bool, str]:
-    """Safely save a token file, preventing overwrites with different users.
+    """Safely save a token file, preventing overwrites with different token identities.
     
     Returns (success, message).
     """
     if not source_path.exists():
         return False, "Source token file does not exist"
     
-    source_email = get_token_email(source_path)
-    if not source_email or source_email in ("unknown", "error"):
-        return False, "Could not determine email from source token"
+    source_info = get_account_info(source_path) or {}
+    source_email = (source_info.get("email") or "").strip().lower()
+    source_account_id = _normalize_str(source_info.get("account_id"))
+    source_user_id = _normalize_str(source_info.get("user_id"))
+
+    if not source_user_id and not source_account_id and (not source_email or source_email in ("unknown", "error")):
+        return False, "Could not determine identity from source token"
     
-    # If target exists, verify emails match
+    # If target exists, verify token identities match.
     if target_path.exists():
-        target_email = get_token_email(target_path)
-        if target_email and target_email not in ("unknown", "error"):
-            if source_email != target_email:
-                if not force:
-                    return False, f"Refusing to overwrite: target has {target_email}, source has {source_email}"
-                # Force mode: warn but proceed
-                print(f"⚠️  Warning: overwriting {target_email} with {source_email} (--force)")
+        target_info = get_account_info(target_path) or {}
+        target_email = (target_info.get("email") or "").strip().lower()
+        target_account_id = _normalize_str(target_info.get("account_id"))
+        target_user_id = _normalize_str(target_info.get("user_id"))
+
+        mismatch = None
+        if source_user_id and target_user_id and source_user_id != target_user_id:
+            mismatch = f"target has user_id {target_user_id}, source has {source_user_id}"
+        elif source_email and target_email and target_email not in ("unknown", "error") and source_email != target_email:
+            mismatch = f"target has {target_email}, source has {source_email}"
+        elif source_account_id and target_account_id and source_account_id != target_account_id:
+            mismatch = f"target has account_id {target_account_id}, source has {source_account_id}"
+
+        if mismatch:
+            if not force:
+                return False, f"Refusing to overwrite: {mismatch}"
+            # Force mode: warn but proceed
+            print(f"⚠️  Warning: overwriting despite identity mismatch ({mismatch}) (--force)")
     
     shutil.copy2(source_path, target_path)
-    return True, f"Saved token for {source_email}"
+    _annotate_snapshot_file(target_path)
+    if source_user_id:
+        return True, f"Saved token for user_id {source_user_id}"
+    if source_email and source_email not in ("unknown", "error"):
+        return True, f"Saved token for {source_email}"
+    return True, f"Saved token for account_id {source_account_id}"
 
 
 def cmd_save(name: str, force: bool = False):
@@ -829,6 +1321,7 @@ def cmd_save(name: str, force: bool = False):
     
     if success:
         print(f"✅ {message} as '{name}'")
+        sync_to_openclaw(name, target)
     else:
         print(f"❌ {message}")
 
@@ -839,8 +1332,8 @@ def sync_current_login_to_snapshot() -> None:
     This makes snapshots behave like "last known good refreshed token state".
 
     Rules:
-    - If the current login's email matches an existing snapshot (any name), update that file.
-    - If it doesn't match any snapshot, create a new snapshot using the email local-part.
+    - If the current login's token identity matches an existing snapshot (any name), update that file.
+    - If it doesn't match any snapshot, create a new snapshot using the email local-part, or userId if email is unavailable.
     - NEVER overwrite a snapshot with a different user's token (safety check).
 
     This runs silently (no prints) because it's executed on every invocation.
@@ -851,22 +1344,27 @@ def sync_current_login_to_snapshot() -> None:
             return
 
         info = get_account_info(AUTH_FILE) or {}
+        account_id = info.get("account_id")
+        user_id = info.get("user_id")
         email = (info.get("email") or "").strip().lower()
-        if not email or email in ("unknown", "error"):
+        if not user_id and (not email or email in ("unknown", "error")) and not account_id:
             return
 
-        match = _resolve_matching_account_by_email(email)
+        match = _resolve_matching_account(account_id, user_id, email)
         if match is not None:
             if not is_current(match):
-                # Safety check: verify emails match before overwriting
+                # Safety check: verify token identities match before overwriting
                 success, _ = safe_save_token(AUTH_FILE, match, force=False)
-                # Silently ignore failures (e.g., email mismatch)
+                if success:
+                    sync_to_openclaw(match.stem, match)
+                # Silently ignore failures (e.g., identity mismatch)
             return
 
-        # No match: create a new snapshot with local-part name
-        suggested = email.split("@", 1)[0].strip() or "account"
+        # No match: create a new snapshot using email local-part or userId
+        suggested = _suggested_account_name(email, user_id)
         name, target = _resolve_unique_name_path(suggested)
-        shutil.copy2(AUTH_FILE, target)
+        safe_save_token(AUTH_FILE, target, force=False)
+        sync_to_openclaw(name, target)
     except Exception:
         # Never fail the command because of sync.
         return
@@ -891,7 +1389,7 @@ def main():
     add_parser = subparsers.add_parser("add", help="Run a fresh login and save as an account")
     add_parser.add_argument(
         "--name",
-        help="Optional account name (non-interactive default). If omitted, uses email local-part.",
+        help="Optional account name (non-interactive default). If omitted, uses email local-part or userId.",
     )
 
     use_parser = subparsers.add_parser("use", help="Switch to an account")
@@ -904,10 +1402,18 @@ def main():
     auto_parser = subparsers.add_parser("auto", help="Switch to the account with most quota available")
     auto_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    compare_parser = subparsers.add_parser("compare", help="Compare decoded token claims between two saved accounts")
+    compare_parser.add_argument("left", help="First account name")
+    compare_parser.add_argument("right", help="Second account name")
+    compare_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    subparsers.add_parser("sync", help="Sync saved accounts to OpenClaw auth profiles")
+
     args = parser.parse_args()
 
     # Always persist the currently active login back into its named snapshot.
     sync_current_login_to_snapshot()
+    sync_saved_openclaw_profiles()
 
     if args.command == "add":
         cmd_add(name_override=getattr(args, "name", None))
@@ -917,6 +1423,10 @@ def main():
         cmd_save(args.name, force=bool(getattr(args, "force", False)))
     elif args.command == "auto":
         cmd_auto(json_mode=bool(getattr(args, "json", False)))
+    elif args.command == "compare":
+        cmd_compare(args.left, args.right, json_mode=bool(getattr(args, "json", False)))
+    elif args.command == "sync":
+        cmd_sync()
     else:
         cmd_list(
             verbose=bool(getattr(args, "verbose", False)),
