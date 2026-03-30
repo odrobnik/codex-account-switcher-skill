@@ -1137,30 +1137,45 @@ def cmd_auto(json_mode=False):
         else:
             print(f"\n✅ Switched to: {best}")
         
-        effective = valid[best]['effective_weekly_used']
-        actual = valid[best]['weekly_used']
-        if effective < actual:
-            print(f"   Weekly quota: RESET (was {actual:.0f}%, now fresh)")
-        else:
-            print(f"   Weekly quota: {actual:.0f}% used ({valid[best]['available']:.0f}% available)")
+        # Show table sorted by score (best first)
+        sorted_accounts = sorted(
+            results.items(),
+            key=lambda x: x[1].get('_score', 999) if '_score' in x[1] else 999
+        )
         
-        # Show comparison
-        print(f"\nAll accounts:")
-        for name, data in sorted(results.items(), key=lambda x: (x[1].get('effective_weekly_used', 999), x[1].get('weekly_resets_at', float('inf')))):
+        # Header
+        print(f"\n{'Account':<12} {'7d':>5} {'5h':>5} {'Score':>7} {'7d Resets':>14}")
+        print(f"{'─' * 12} {'─' * 5} {'─' * 5} {'─' * 7} {'─' * 14}")
+        
+        for name, data in sorted_accounts:
             if 'error' in data:
-                print(f"   {name}: {data['error']}")
+                print(f"{name:<12} {'err':>5} {'':>5} {'':>7} {data['error']}")
+                continue
+            
+            marker = " ←" if name == best else ""
+            weekly = data.get('effective_weekly_used', data.get('weekly_used', 0))
+            daily = data.get('effective_daily_used', data.get('daily_used', 0))
+            score = data.get('_score', 0)
+            resets_at = data.get('weekly_resets_at', 0)
+            
+            # Format weekly with reset indicator
+            if data.get('effective_weekly_used', 999) < data.get('weekly_used', 0):
+                weekly_str = "RST"
+            elif weekly >= 100:
+                weekly_str = "MAX"
             else:
-                marker = " ←" if name == best else ""
-                eff = data['effective_weekly_used']
-                act = data['weekly_used']
-                resets_at = data.get('weekly_resets_at', 0)
-                
-                if eff < act:
-                    reset_dt = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M")
-                    print(f"   {name}: RESET (was {act:.0f}%, reset at {reset_dt}){marker}")
-                else:
-                    reset_dt = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M")
-                    print(f"   {name}: {act:.0f}% used (resets {reset_dt}){marker}")
+                weekly_str = f"{weekly:.0f}%"
+            
+            # Format daily
+            if daily >= 100:
+                daily_str = "MAX"
+            else:
+                daily_str = f"{daily:.0f}%"
+            
+            # Format reset time
+            reset_str = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M") if resets_at else "?"
+            
+            print(f"{name:<12} {weekly_str:>5} {daily_str:>5} {score:>+7.1f} {reset_str:>14}{marker}")
 
 def cmd_use(name):
     ensure_dirs()
