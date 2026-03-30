@@ -1071,20 +1071,43 @@ def cmd_auto(json_mode=False):
     
     # Sort by: 1) lowest effective usage, 2) earliest reset time (if both at 100%)
     def sort_key(k):
+        """Budget-based scoring: prefer accounts under their ideal usage pace.
+
+        Weekly budget: if you spread 100% evenly over 7 days, at any point
+        you know where you *should* be: budget = (elapsed / 168h) * 100%.
+        Score = actual% - budget%. Negative = under budget (good).
+
+        5h penalty: if the 5h window is nearly maxed, the account is about
+        to get blocked regardless of weekly headroom.
+        """
         v = valid[k]
         weekly = v['effective_weekly_used']
         daily = v.get('effective_daily_used', 0)
-        weekly_resets = v.get('weekly_resets_at', float('inf'))
+        weekly_resets = v.get('weekly_resets_at', 0)
+        daily_resets = v.get('daily_resets_at', 0)
 
-        # An account is blocked if either window is at 100%
-        is_blocked = 1 if (weekly >= 100 or daily >= 100) else 0
+        # Weekly budget score
+        weekly_window = 168 * 3600  # 7 days in seconds
+        weekly_elapsed = weekly_window - max(0, weekly_resets - now)
+        weekly_budget = (weekly_elapsed / weekly_window) * 100 if weekly_window > 0 else 0
+        weekly_score = weekly - weekly_budget  # negative = under budget
 
-        # Primary sort: blocked accounts last
-        # Secondary sort: lower weekly usage preferred
-        # Tertiary sort: lower daily usage preferred
-        # Quaternary sort: earlier weekly reset (recovers sooner)
-        return (is_blocked, weekly, daily, weekly_resets)
+        # 5h penalty: if daily is almost maxed, heavily penalize
+        if daily >= 100:
+            daily_penalty = 200   # blocked right now
+        elif daily >= 90:
+            daily_penalty = 50    # about to be blocked
+        elif daily >= 75:
+            daily_penalty = 10    # getting warm
+        else:
+            daily_penalty = 0     # fine
+
+        return weekly_score + daily_penalty
     
+    # Compute and attach scores for transparency
+    for k in valid:
+        valid[k]['_score'] = sort_key(k)
+
     best = min(valid.keys(), key=sort_key)
     
     # Check if already on best account
