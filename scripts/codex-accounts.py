@@ -1086,7 +1086,13 @@ def cmd_auto(json_mode=False):
         weekly_resets = v.get('weekly_resets_at', 0)
         daily_resets = v.get('daily_resets_at', 0)
 
-        # Weekly budget score
+        # Hard block: either window at 100% means the account is unusable
+        if weekly >= 100:
+            weekly_penalty = 500  # completely blocked on weekly
+        else:
+            weekly_penalty = 0
+
+        # Weekly budget score (only meaningful if not blocked)
         weekly_window = 168 * 3600  # 7 days in seconds
         weekly_elapsed = weekly_window - max(0, weekly_resets - now)
         weekly_budget = (weekly_elapsed / weekly_window) * 100 if weekly_window > 0 else 0
@@ -1102,7 +1108,7 @@ def cmd_auto(json_mode=False):
         else:
             daily_penalty = 0     # fine
 
-        return weekly_score + daily_penalty
+        return weekly_penalty + weekly_score + daily_penalty
     
     # Compute and attach scores for transparency
     for k in valid:
