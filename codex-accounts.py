@@ -17,6 +17,7 @@ ACCOUNTS_DIR = CODEX_DIR / "accounts"
 OPENCLAW_AUTH_PROFILES_FILE = (
     Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
 )
+OPENCLAW_AGENTS_DIR = Path.home() / ".openclaw" / "agents"
 
 def ensure_dirs():
     if not ACCOUNTS_DIR.exists():
@@ -1142,61 +1143,167 @@ def cmd_use(name):
     # Sync token to OpenClaw
     sync_to_openclaw(name, source)
 
+def _extract_openclaw_token_payload(source_path):
+    """Extract token fields from a Codex snapshot for OpenClaw sync."""
+    with open(source_path, "r") as f:
+        data = json.load(f)
+
+    tokens = _get_tokens(data)
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    id_token = tokens.get("id_token")
+    account_id = _read_codex_account_id(data) or ""
+
+    if not access_token or not refresh_token:
+        return None
+
+    # Prefer access_token expiry (long-lived, used for API calls) over
+    # id_token expiry (short-lived, only for identity).
+    expires = 0
+    for token_key in ("access_token", "id_token"):
+        tok = tokens.get(token_key)
+        if tok and "." in tok:
+            try:
+                seg = tok.split(".")[1]
+                seg += '=' * (-len(seg) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(seg))
+                exp = int(decoded.get("exp", 0))
+                if exp > 0:
+                    candidate = exp * 1000
+                    if candidate > expires:
+                        expires = candidate
+            except Exception:
+                pass
+
+    # Extract email from token for profile key
+    email = None
+    for token_key in ("id_token", "access_token"):
+        tok = tokens.get(token_key)
+        if tok and "." in tok:
+            try:
+                seg = tok.split(".")[1]
+                seg += '=' * (-len(seg) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(seg))
+                profile = decoded.get("https://api.openai.com/profile", {})
+                email = profile.get("email") or decoded.get("email")
+                if email:
+                    break
+            except Exception:
+                pass
+
+    return {
+        "access": access_token,
+        "refresh": refresh_token,
+        "expires": expires,
+        "accountId": account_id,
+        "email": email,
+    }
+
+
+def _sync_to_agent_auth_json(token_payload, quiet: bool = False):
+    """Sync the active Codex token into every OpenClaw agent's auth.json.
+
+    Each agent has ~/.openclaw/agents/<id>/agent/auth.json with a top-level
+    'openai-codex' key containing {type, access, refresh, expires}.
+    """
+    if not OPENCLAW_AGENTS_DIR.is_dir():
+        return
+
+    updated = []
+    for agent_dir in sorted(OPENCLAW_AGENTS_DIR.iterdir()):
+        auth_file = agent_dir / "agent" / "auth.json"
+        if not auth_file.exists():
+            continue
+
+        try:
+            with open(auth_file, "r") as f:
+                agent_data = json.load(f)
+
+            if not isinstance(agent_data, dict):
+                continue
+
+            # Only update if there's already an openai-codex entry (don't inject into agents that don't use it)
+            if "openai-codex" not in agent_data:
+                continue
+
+            agent_data["openai-codex"] = {
+                "type": "oauth",
+                "access": token_payload["access"],
+                "refresh": token_payload["refresh"],
+                "expires": token_payload["expires"],
+            }
+
+            with open(auth_file, "w") as f:
+                json.dump(agent_data, f, indent=2)
+                f.write("\n")
+
+            updated.append(agent_dir.name)
+        except Exception:
+            continue
+
+    if updated and not quiet:
+        print(f"✅ Updated auth.json for agent(s): {', '.join(updated)}", file=sys.stderr)
+
+
 def sync_to_openclaw(name, source_path, quiet: bool = False):
     try:
-        with open(source_path, "r") as f:
-            data = json.load(f)
-            
-        tokens = _get_tokens(data)
-        access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
-        id_token = tokens.get("id_token")
-        account_id = _read_codex_account_id(data) or ""
-        
-        if not access_token or not refresh_token:
+        token_payload = _extract_openclaw_token_payload(source_path)
+        if not token_payload:
             return
-            
-        expires = 0
-        if id_token and "." in id_token:
+
+                # 1. Update auth-profiles.json for ALL agents
+        agents_dir = Path.home() / ".openclaw" / "agents"
+        profile_paths = []
+        if agents_dir.is_dir():
+            for agent_dir in sorted(agents_dir.iterdir()):
+                ap = agent_dir / "agent" / "auth-profiles.json"
+                if ap.exists():
+                    profile_paths.append(ap)
+
+        # Fallback to just main if nothing found
+        if not profile_paths:
+            profile_paths = [OPENCLAW_AUTH_PROFILES_FILE]
+
+        updated_agents = []
+        email = token_payload.get("email") or name
+        profile_id = f"openai-codex:{email}"
+
+        for oc_path in profile_paths:
             try:
-                payload = id_token.split(".")[1]
-                payload += '=' * (-len(payload) % 4)
-                decoded = json.loads(base64.urlsafe_b64decode(payload))
-                expires = int(decoded.get("exp", 0)) * 1000
-            except:
-                pass
-                
-        # Target path inside OpenClaw
-        oc_path = OPENCLAW_AUTH_PROFILES_FILE
-        if not oc_path.exists():
-            return
-            
-        with open(oc_path, "r") as f:
-            oc_data = json.load(f)
-            
-        if "profiles" not in oc_data:
-            oc_data["profiles"] = {}
-            
-        profile_id = f"openai-codex:{name}"
-        
-        oc_data["profiles"][profile_id] = {
-            "type": "oauth",
-            "provider": "openai-codex",
-            "access": access_token,
-            "refresh": refresh_token,
-            "expires": expires,
-            "accountId": account_id
-        }
-        
-        with open(oc_path, "w") as f:
-            json.dump(oc_data, f, indent=2)
-            
-        # Also notify gateway to reload? We can just restart gateway, or let the user do it
-        # Actually, OpenClaw re-reads the file lazily on request in most cases, 
-        # but a gateway restart might be needed depending on the agent runtime
-        
-        if not quiet:
-            print(f"✅ Synced {name} token to OpenClaw auth-profiles.json (main agent)", file=sys.stderr)
+                with open(oc_path, "r") as f:
+                    oc_data = json.load(f)
+
+                if "profiles" not in oc_data:
+                    oc_data["profiles"] = {}
+
+                # Remove old name-based key if it exists (migration)
+                old_key = f"openai-codex:{name}"
+                if old_key in oc_data["profiles"] and old_key != profile_id:
+                    del oc_data["profiles"][old_key]
+
+                oc_data["profiles"][profile_id] = {
+                    "type": "oauth",
+                    "provider": "openai-codex",
+                    "access": token_payload["access"],
+                    "refresh": token_payload["refresh"],
+                    "expires": token_payload["expires"],
+                    "accountId": token_payload.get("accountId", ""),
+                    "email": email,
+                }
+
+                with open(oc_path, "w") as f:
+                    json.dump(oc_data, f, indent=2)
+
+                updated_agents.append(oc_path.parent.parent.name)
+            except Exception:
+                continue
+
+        if not quiet and updated_agents:
+            print(f"\u2705 Synced {name} token to OpenClaw auth-profiles.json ({', '.join(updated_agents)})", file=sys.stderr)
+
+        # 2. Update every agent's auth.json that has an openai-codex entry
+        _sync_to_agent_auth_json(token_payload, quiet=quiet)
+
     except Exception as e:
         if not quiet:
             print(f"⚠️ Failed to sync to OpenClaw: {e}", file=sys.stderr)
