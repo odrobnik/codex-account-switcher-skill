@@ -1175,7 +1175,14 @@ def cmd_auto(json_mode=False):
             # Format reset times
             reset_str = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M") if resets_at else "?"
             daily_resets = data.get('daily_resets_at', 0)
-            daily_reset_str = datetime.fromtimestamp(daily_resets).strftime("%H:%M") if daily_resets else "?"
+            if daily_resets and daily_resets > now:
+                delta_s = int(daily_resets - now)
+                h, m = delta_s // 3600, (delta_s % 3600) // 60
+                daily_reset_str = f"in {h}h {m:02d}m"
+            elif daily_resets:
+                daily_reset_str = "reset"
+            else:
+                daily_reset_str = "?"
             
             print(f"{name:<12} {weekly_str:>5} {daily_str:>5} {score:>+7.1f} {reset_str:>14} {daily_reset_str:>14}{marker}")
 
