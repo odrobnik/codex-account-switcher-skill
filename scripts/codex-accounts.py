@@ -1118,7 +1118,7 @@ def cmd_auto(json_mode=False):
         shutil.copy(ACCOUNTS_DIR / f"{best}.json", AUTH_FILE)
         log_account_switch(best, get_user_id_from_auth(ACCOUNTS_DIR / f"{best}.json"))
     
-    sync_to_openclaw(best, ACCOUNTS_DIR / f"{best}.json")
+    sync_saved_openclaw_profiles()
     
     if json_mode:
         print(json.dumps({
@@ -1197,7 +1197,7 @@ def cmd_use(name):
     print(f"✅ Switched to account: {name} ({_describe_identity(info)})")
     
     # Sync token to OpenClaw
-    sync_to_openclaw(name, source)
+    sync_saved_openclaw_profiles()
 
 def _extract_openclaw_token_payload(source_path):
     """Extract token fields from a Codex snapshot for OpenClaw sync."""
