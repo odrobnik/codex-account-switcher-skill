@@ -1113,9 +1113,11 @@ def cmd_auto(json_mode=False):
     # Check if already on best account
     already_active = (original_account == best)
     
-    # Only switch if not already active
+    # Always restore auth.json to the best account.
+    # Probing switches auth.json to each account in turn, so after
+    # probing it points at the LAST probed account, not the best one.
+    shutil.copy(ACCOUNTS_DIR / f"{best}.json", AUTH_FILE)
     if not already_active:
-        shutil.copy(ACCOUNTS_DIR / f"{best}.json", AUTH_FILE)
         log_account_switch(best, get_user_id_from_auth(ACCOUNTS_DIR / f"{best}.json"))
     
     sync_saved_openclaw_profiles()
