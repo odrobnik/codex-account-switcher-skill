@@ -914,9 +914,14 @@ def _quota_summary(limits: dict) -> dict | None:
     if not isinstance(resets_at, (int, float)):
         resets_at = 0
 
+    daily_resets_at = primary.get("resets_at", 0) if primary else 0
+    if not isinstance(daily_resets_at, (int, float)):
+        daily_resets_at = 0
+
     return {
         "used_percent": float(used_percent),
         "daily_used": float(daily_used) if daily_used is not None else None,
+        "daily_resets_at": int(daily_resets_at),
         "resets_at": int(resets_at),
         "source": "secondary" if secondary else "primary",
     }
@@ -1029,11 +1034,16 @@ def cmd_auto(json_mode=False):
             # If quota has already reset, treat as 0% used
             effective_weekly_pct = 0 if now >= weekly_resets_at else weekly_pct
             
+            daily_resets_at = quota.get('daily_resets_at', 0)
+            effective_daily_pct = 0 if (daily_resets_at and now >= daily_resets_at) else (daily_pct or 0)
+
             results[name] = {
                 'weekly_used': weekly_pct,
                 'weekly_resets_at': weekly_resets_at,
                 'effective_weekly_used': effective_weekly_pct,
                 'daily_used': daily_pct,
+                'daily_resets_at': daily_resets_at,
+                'effective_daily_used': effective_daily_pct,
                 'available': 100 - effective_weekly_pct,
                 'quota_source': quota['source'],
             }
@@ -1062,10 +1072,18 @@ def cmd_auto(json_mode=False):
     # Sort by: 1) lowest effective usage, 2) earliest reset time (if both at 100%)
     def sort_key(k):
         v = valid[k]
-        effective = v['effective_weekly_used']
-        resets_at = v.get('weekly_resets_at', float('inf'))
-        # Return (effective_usage, resets_at) - lower is better
-        return (effective, resets_at)
+        weekly = v['effective_weekly_used']
+        daily = v.get('effective_daily_used', 0)
+        weekly_resets = v.get('weekly_resets_at', float('inf'))
+
+        # An account is blocked if either window is at 100%
+        is_blocked = 1 if (weekly >= 100 or daily >= 100) else 0
+
+        # Primary sort: blocked accounts last
+        # Secondary sort: lower weekly usage preferred
+        # Tertiary sort: lower daily usage preferred
+        # Quaternary sort: earlier weekly reset (recovers sooner)
+        return (is_blocked, weekly, daily, weekly_resets)
     
     best = min(valid.keys(), key=sort_key)
     
