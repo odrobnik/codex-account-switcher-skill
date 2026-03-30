@@ -1144,8 +1144,8 @@ def cmd_auto(json_mode=False):
         )
         
         # Header
-        print(f"\n{'Account':<12} {'7d':>5} {'5h':>5} {'Score':>7} {'7d Resets':>14}")
-        print(f"{'─' * 12} {'─' * 5} {'─' * 5} {'─' * 7} {'─' * 14}")
+        print(f"\n{'Account':<12} {'7d':>5} {'5h':>5} {'Score':>7} {'7d Resets':>14} {'5h Resets':>14}")
+        print(f"{'─' * 12} {'─' * 5} {'─' * 5} {'─' * 7} {'─' * 14} {'─' * 14}")
         
         for name, data in sorted_accounts:
             if 'error' in data:
@@ -1172,10 +1172,12 @@ def cmd_auto(json_mode=False):
             else:
                 daily_str = f"{daily:.0f}%"
             
-            # Format reset time
+            # Format reset times
             reset_str = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M") if resets_at else "?"
+            daily_resets = data.get('daily_resets_at', 0)
+            daily_reset_str = datetime.fromtimestamp(daily_resets).strftime("%H:%M") if daily_resets else "?"
             
-            print(f"{name:<12} {weekly_str:>5} {daily_str:>5} {score:>+7.1f} {reset_str:>14}{marker}")
+            print(f"{name:<12} {weekly_str:>5} {daily_str:>5} {score:>+7.1f} {reset_str:>14} {daily_reset_str:>14}{marker}")
 
 def cmd_use(name):
     ensure_dirs()
