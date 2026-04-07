@@ -575,7 +575,7 @@ def _iter_account_snapshot_files():
         yield path
 
 
-def cmd_add(name_override: str | None = None):
+def cmd_add(name_override: str | None = None, sync_openclaw: bool = False, agent_names: list[str] | None = None):
     """Add accounts by ALWAYS running a fresh login flow.
 
     Behavior:
@@ -623,14 +623,16 @@ def cmd_add(name_override: str | None = None):
                 print(f"ℹ️  Updating existing account '{match.stem}' ({identity_label})")
                 safe_save_token(AUTH_FILE, match, force=False)
             print(f"✅ Saved '{match.stem}' ({identity_label})")
-            sync_to_openclaw(match.stem, match)
+            if sync_openclaw:
+                sync_to_openclaw(match.stem, match, agent_names=agent_names)
         else:
             # 2) Otherwise, create a new snapshot with default (or override) name.
             base_name = (name_override or suggested).strip() or suggested
             name, target = _resolve_unique_name_path(base_name)
             safe_save_token(AUTH_FILE, target, force=False)
             print(f"✅ Saved '{name}' ({identity_label})")
-            sync_to_openclaw(name, target)
+            if sync_openclaw:
+                sync_to_openclaw(name, target, agent_names=agent_names)
 
         if not interactive:
             return
@@ -813,23 +815,91 @@ def _load_quota_cache(name, max_age_hours=24):
         pass
     return None
 
+def _extract_rate_limits_from_session_file(session_file: Path):
+    """Extract the last valid rate_limits object from a Codex session file."""
+    try:
+        with open(session_file, 'r') as f:
+            lines = f.readlines()
+
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            payload = event.get('payload', {})
+            if payload.get('type') != 'token_count':
+                continue
+
+            rate_limits = payload.get('rate_limits')
+            primary = rate_limits.get('primary') if isinstance(rate_limits, dict) else None
+            secondary = rate_limits.get('secondary') if isinstance(rate_limits, dict) else None
+            if primary and secondary:
+                return rate_limits
+    except Exception:
+        pass
+    return None
+
+
+def _find_recent_session_with_rate_limits(after_ts: float | None = None) -> tuple[Path, dict] | tuple[None, None]:
+    """Find the newest recent session file containing valid rate limits."""
+    from datetime import datetime
+
+    sessions_dir = CODEX_DIR / "sessions"
+    now = datetime.now()
+    candidates: list[Path] = []
+
+    for day_offset in range(2):
+        date = datetime.fromordinal(now.toordinal() - day_offset)
+        day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
+        if not day_dir.exists():
+            continue
+        candidates.extend(day_dir.glob("*.jsonl"))
+
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    for session_file in candidates:
+        try:
+            if after_ts is not None and session_file.stat().st_mtime < after_ts:
+                continue
+        except Exception:
+            continue
+
+        limits = _extract_rate_limits_from_session_file(session_file)
+        if limits:
+            return session_file, limits
+
+    return None, None
+
+
 def _get_quota_for_account(name):
-    """Get quota info for an account by switching to it and pinging Codex."""
+    """Get quota info for an account by switching to it and probing Codex.
+
+    Probe strategy mirrors codex-quota:
+    1. Switch ~/.codex/auth.json to the target account.
+    2. Run a lightweight `codex exec` probe.
+    3. Prefer the exact session file if it contains rate limits.
+    4. Otherwise fall back to the most recent session with valid rate limits.
+    5. Finally fall back to the cached quota file.
+    """
     import subprocess
     import time
     import re
     from datetime import datetime
-    
+
     source = ACCOUNTS_DIR / f"{name}.json"
     if not source.exists():
         return None
-    
+
     # Switch to account
     shutil.copy(source, AUTH_FILE)
     user_id = get_user_id_from_auth(source)
     log_account_switch(name, user_id)
-    
-    # Ping codex to get a fresh session (for rate limit info)
+
+    probe_started_at = time.time()
+
+    # Probe codex to get a fresh session (for rate limit info)
     session_id = None
     try:
         result = subprocess.run(
@@ -837,9 +907,9 @@ def _get_quota_for_account(name):
                 "codex",
                 "exec",
                 "--skip-git-repo-check",
-                f'Quota-Probe for\n\n```json\n{{"user_id": "{user_id or ""}"}}\n```\n\nOnly reply `OK`',
+                "reply OK",
             ],
-            cwd=str(CODEX_DIR),
+            cwd=str(Path.home()),
             capture_output=True,
             text=True,
             timeout=60,
@@ -849,42 +919,37 @@ def _get_quota_for_account(name):
             session_id = match.group(1)
     except Exception:
         pass
-    
+
     time.sleep(1)
-    
+
     if session_id:
         sessions_dir = CODEX_DIR / "sessions"
         now = datetime.now()
-        
+
         for day_offset in range(2):
             date = datetime.fromordinal(now.toordinal() - day_offset)
             day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
-            
+
             if not day_dir.exists():
                 continue
-                
+
             for session_file in day_dir.glob(f"*{session_id}.jsonl"):
-                with open(session_file, 'r') as f:
-                    lines = f.readlines()
-                
-                for line in reversed(lines):
-                    if not line.strip():
-                        continue
-                    try:
-                        event = json.loads(line)
-                        if (event.get('payload', {}).get('type') == 'token_count' and
-                            event.get('payload', {}).get('rate_limits')):
-                            limits = event['payload']['rate_limits']
-                            _save_quota_cache(name, limits)
-                            return limits
-                    except json.JSONDecodeError:
-                        continue
-    
+                limits = _extract_rate_limits_from_session_file(session_file)
+                if limits:
+                    _save_quota_cache(name, limits)
+                    return limits
+
+    # Fallback: recent session with valid rate limits (codex-quota style)
+    _, limits = _find_recent_session_with_rate_limits(after_ts=probe_started_at)
+    if limits:
+        _save_quota_cache(name, limits)
+        return limits
+
     # No fresh rate_limits - try cached data
     cached = _load_quota_cache(name)
     if cached:
         return cached
-    
+
     return None
 
 
@@ -927,11 +992,14 @@ def _quota_summary(limits: dict) -> dict | None:
     }
 
 
-def cmd_sync():
-    """Sync all saved Codex snapshots into OpenClaw auth profiles."""
+def cmd_sync(account_names: list[str] | None = None, agent_names: list[str] | None = None, dry_run: bool = False):
+    """Sync saved Codex snapshots into OpenClaw auth profiles."""
     ensure_dirs()
-    sync_saved_openclaw_profiles()
-    print("✅ Synced saved accounts to OpenClaw auth-profiles.json")
+    synced = sync_saved_openclaw_profiles(account_names=account_names, agent_names=agent_names, dry_run=dry_run)
+    if dry_run:
+        print(f"✅ Dry run complete for {synced} account snapshot(s)")
+    else:
+        print(f"✅ Synced {synced} account snapshot(s) to OpenClaw")
 
 
 def cmd_compare(name_a: str, name_b: str, json_mode: bool = False):
@@ -993,7 +1061,7 @@ def cmd_compare(name_a: str, name_b: str, json_mode: bool = False):
         print(f"  {name_a}: {json.dumps(diff[name_a], ensure_ascii=False)}")
         print(f"  {name_b}: {json.dumps(diff[name_b], ensure_ascii=False)}")
 
-def cmd_auto(json_mode=False):
+def cmd_auto(json_mode=False, sync_openclaw: bool = False, agent_names: list[str] | None = None):
     """Switch to the account with the most quota available."""
     import time
     ensure_dirs()
@@ -1125,8 +1193,9 @@ def cmd_auto(json_mode=False):
     shutil.copy(ACCOUNTS_DIR / f"{best}.json", AUTH_FILE)
     if not already_active:
         log_account_switch(best, get_user_id_from_auth(ACCOUNTS_DIR / f"{best}.json"))
-    
-    sync_saved_openclaw_profiles()
+
+    if sync_openclaw:
+        sync_saved_openclaw_profiles(account_names=[best], agent_names=agent_names)
     
     if json_mode:
         print(json.dumps({
@@ -1194,7 +1263,7 @@ def cmd_auto(json_mode=False):
             
             print(f"{name:<12} {weekly_str:>5} {daily_str:>5} {score:>+7.1f} {reset_str:>14} {daily_reset_str:>14}{marker}")
 
-def cmd_use(name):
+def cmd_use(name, sync_openclaw: bool = False, agent_names: list[str] | None = None):
     ensure_dirs()
     source = ACCOUNTS_DIR / f"{name}.json"
     
@@ -1212,9 +1281,9 @@ def cmd_use(name):
     log_account_switch(name, get_user_id_from_auth(source))
     info = get_account_info(source)
     print(f"✅ Switched to account: {name} ({_describe_identity(info)})")
-    
-    # Sync token to OpenClaw
-    sync_saved_openclaw_profiles()
+
+    if sync_openclaw:
+        sync_saved_openclaw_profiles(account_names=[name], agent_names=agent_names)
 
 def _extract_openclaw_token_payload(source_path):
     """Extract token fields from a Codex snapshot for OpenClaw sync."""
@@ -1273,17 +1342,33 @@ def _extract_openclaw_token_payload(source_path):
     }
 
 
-def _sync_to_agent_auth_json(token_payload, quiet: bool = False):
-    """Sync the active Codex token into every OpenClaw agent's auth.json.
+def _selected_agent_dirs(agent_names: list[str] | None = None) -> list[Path]:
+    if not OPENCLAW_AGENTS_DIR.is_dir():
+        return []
+
+    wanted = {name.strip() for name in (agent_names or []) if name and name.strip()}
+    selected = []
+    for agent_dir in sorted(OPENCLAW_AGENTS_DIR.iterdir()):
+        if not agent_dir.is_dir():
+            continue
+        if wanted and agent_dir.name not in wanted:
+            continue
+        selected.append(agent_dir)
+    return selected
+
+
+def _sync_to_agent_auth_json(token_payload, quiet: bool = False, agent_names: list[str] | None = None, dry_run: bool = False):
+    """Sync the active Codex token into selected OpenClaw agents' auth.json.
 
     Each agent has ~/.openclaw/agents/<id>/agent/auth.json with a top-level
     'openai-codex' key containing {type, access, refresh, expires}.
     """
-    if not OPENCLAW_AGENTS_DIR.is_dir():
-        return
+    agent_dirs = _selected_agent_dirs(agent_names)
+    if not agent_dirs:
+        return []
 
     updated = []
-    for agent_dir in sorted(OPENCLAW_AGENTS_DIR.iterdir()):
+    for agent_dir in agent_dirs:
         auth_file = agent_dir / "agent" / "auth.json"
         if not auth_file.exists():
             continue
@@ -1306,35 +1391,37 @@ def _sync_to_agent_auth_json(token_payload, quiet: bool = False):
                 "expires": token_payload["expires"],
             }
 
-            with open(auth_file, "w") as f:
-                json.dump(agent_data, f, indent=2)
-                f.write("\n")
+            if not dry_run:
+                with open(auth_file, "w") as f:
+                    json.dump(agent_data, f, indent=2)
+                    f.write("\n")
 
             updated.append(agent_dir.name)
         except Exception:
             continue
 
     if updated and not quiet:
-        print(f"✅ Updated auth.json for agent(s): {', '.join(updated)}", file=sys.stderr)
+        prefix = "Would update" if dry_run else "Updated"
+        print(f"✅ {prefix} auth.json for agent(s): {', '.join(updated)}", file=sys.stderr)
+
+    return updated
 
 
-def sync_to_openclaw(name, source_path, quiet: bool = False):
+def sync_to_openclaw(name, source_path, quiet: bool = False, agent_names: list[str] | None = None, dry_run: bool = False):
     try:
         token_payload = _extract_openclaw_token_payload(source_path)
         if not token_payload:
-            return
+            return False
 
-                # 1. Update auth-profiles.json for ALL agents
-        agents_dir = Path.home() / ".openclaw" / "agents"
+        # 1. Update auth-profiles.json for selected agents
         profile_paths = []
-        if agents_dir.is_dir():
-            for agent_dir in sorted(agents_dir.iterdir()):
-                ap = agent_dir / "agent" / "auth-profiles.json"
-                if ap.exists():
-                    profile_paths.append(ap)
+        for agent_dir in _selected_agent_dirs(agent_names):
+            ap = agent_dir / "agent" / "auth-profiles.json"
+            if ap.exists():
+                profile_paths.append(ap)
 
-        # Fallback to just main if nothing found
-        if not profile_paths:
+        # Fallback to just main if nothing found and no filter was requested
+        if not profile_paths and not agent_names:
             profile_paths = [OPENCLAW_AUTH_PROFILES_FILE]
 
         updated_agents = []
@@ -1364,31 +1451,42 @@ def sync_to_openclaw(name, source_path, quiet: bool = False):
                     "email": email,
                 }
 
-                with open(oc_path, "w") as f:
-                    json.dump(oc_data, f, indent=2)
+                if not dry_run:
+                    with open(oc_path, "w") as f:
+                        json.dump(oc_data, f, indent=2)
 
                 updated_agents.append(oc_path.parent.parent.name)
             except Exception:
                 continue
 
         if not quiet and updated_agents:
-            print(f"\u2705 Synced {name} token to OpenClaw auth-profiles.json ({', '.join(updated_agents)})", file=sys.stderr)
+            prefix = "Would sync" if dry_run else "Synced"
+            print(f"\u2705 {prefix} {name} token to OpenClaw auth-profiles.json ({', '.join(updated_agents)})", file=sys.stderr)
 
-        # 2. Update every agent's auth.json that has an openai-codex entry
-        _sync_to_agent_auth_json(token_payload, quiet=quiet)
+        # 2. Update every selected agent's auth.json that has an openai-codex entry
+        _sync_to_agent_auth_json(token_payload, quiet=quiet, agent_names=agent_names, dry_run=dry_run)
+        return True
 
     except Exception as e:
         if not quiet:
             print(f"⚠️ Failed to sync to OpenClaw: {e}", file=sys.stderr)
 
+    return False
 
-def sync_saved_openclaw_profiles() -> None:
-    """Ensure every saved Codex snapshot is mirrored to an OpenClaw profile."""
+
+def sync_saved_openclaw_profiles(account_names: list[str] | None = None, agent_names: list[str] | None = None, dry_run: bool = False) -> int:
+    """Ensure selected saved Codex snapshots are mirrored to OpenClaw profiles."""
+    synced = 0
+    wanted_accounts = set(account_names or [])
     try:
         for account_file in _iter_account_snapshot_files():
-            sync_to_openclaw(account_file.stem, account_file, quiet=True)
+            if wanted_accounts and account_file.stem not in wanted_accounts:
+                continue
+            if sync_to_openclaw(account_file.stem, account_file, quiet=True, agent_names=agent_names, dry_run=dry_run):
+                synced += 1
     except Exception:
-        return
+        return synced
+    return synced
 
 def get_token_email(auth_path) -> str:
     """Extract email from a token file."""
@@ -1488,7 +1586,7 @@ def safe_save_token(source_path: Path, target_path: Path, force: bool = False) -
     return True, f"Saved token for account_id {source_account_id}"
 
 
-def cmd_save(name: str, force: bool = False):
+def cmd_save(name: str, force: bool = False, sync_openclaw: bool = False, agent_names: list[str] | None = None):
     """Save the current auth.json to a named account, with safety check."""
     ensure_dirs()
     
@@ -1501,7 +1599,8 @@ def cmd_save(name: str, force: bool = False):
     
     if success:
         print(f"✅ {message} as '{name}'")
-        sync_to_openclaw(name, target)
+        if sync_openclaw:
+            sync_to_openclaw(name, target, agent_names=agent_names)
     else:
         print(f"❌ {message}")
 
@@ -1534,9 +1633,7 @@ def sync_current_login_to_snapshot() -> None:
         if match is not None:
             if not is_current(match):
                 # Safety check: verify token identities match before overwriting
-                success, _ = safe_save_token(AUTH_FILE, match, force=False)
-                if success:
-                    sync_to_openclaw(match.stem, match)
+                safe_save_token(AUTH_FILE, match, force=False)
                 # Silently ignore failures (e.g., identity mismatch)
             return
 
@@ -1544,7 +1641,6 @@ def sync_current_login_to_snapshot() -> None:
         suggested = _suggested_account_name(email, user_id)
         name, target = _resolve_unique_name_path(suggested)
         safe_save_token(AUTH_FILE, target, force=False)
-        sync_to_openclaw(name, target)
     except Exception:
         # Never fail the command because of sync.
         return
@@ -1571,42 +1667,73 @@ def main():
         "--name",
         help="Optional account name (non-interactive default). If omitted, uses email local-part or userId.",
     )
+    add_parser.add_argument("--sync", action="store_true", help="Also sync the saved token into OpenClaw after saving")
+    add_parser.add_argument("--agent", action="append", help="Limit OpenClaw sync to a specific agent (repeatable)")
 
     use_parser = subparsers.add_parser("use", help="Switch to an account")
     use_parser.add_argument("name", help="Name of the account to switch to")
+    use_parser.add_argument("--sync", action="store_true", help="Also sync this account into OpenClaw after switching")
+    use_parser.add_argument("--agent", action="append", help="Limit OpenClaw sync to a specific agent (repeatable)")
 
     save_parser = subparsers.add_parser("save", help="Save current token to a named account")
     save_parser.add_argument("name", help="Name to save the account as")
     save_parser.add_argument("--force", action="store_true", help="Force overwrite even if emails don't match")
+    save_parser.add_argument("--sync", action="store_true", help="Also sync the saved token into OpenClaw")
+    save_parser.add_argument("--agent", action="append", help="Limit OpenClaw sync to a specific agent (repeatable)")
 
     auto_parser = subparsers.add_parser("auto", help="Switch to the account with most quota available")
     auto_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    auto_parser.add_argument("--sync", action="store_true", help="Also sync the selected account into OpenClaw")
+    auto_parser.add_argument("--agent", action="append", help="Limit OpenClaw sync to a specific agent (repeatable)")
 
     compare_parser = subparsers.add_parser("compare", help="Compare decoded token claims between two saved accounts")
     compare_parser.add_argument("left", help="First account name")
     compare_parser.add_argument("right", help="Second account name")
     compare_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
-    subparsers.add_parser("sync", help="Sync saved accounts to OpenClaw auth profiles")
+    sync_parser = subparsers.add_parser("sync", help="Explicitly sync saved accounts to OpenClaw auth profiles")
+    sync_parser.add_argument("names", nargs="*", help="Optional saved account names to sync (defaults to all)")
+    sync_parser.add_argument("--agent", action="append", help="Limit OpenClaw sync to a specific agent (repeatable)")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Show what would be synced without writing files")
 
     args = parser.parse_args()
 
     # Always persist the currently active login back into its named snapshot.
     sync_current_login_to_snapshot()
-    sync_saved_openclaw_profiles()
 
     if args.command == "add":
-        cmd_add(name_override=getattr(args, "name", None))
+        cmd_add(
+            name_override=getattr(args, "name", None),
+            sync_openclaw=bool(getattr(args, "sync", False)),
+            agent_names=getattr(args, "agent", None),
+        )
     elif args.command == "use":
-        cmd_use(args.name)
+        cmd_use(
+            args.name,
+            sync_openclaw=bool(getattr(args, "sync", False)),
+            agent_names=getattr(args, "agent", None),
+        )
     elif args.command == "save":
-        cmd_save(args.name, force=bool(getattr(args, "force", False)))
+        cmd_save(
+            args.name,
+            force=bool(getattr(args, "force", False)),
+            sync_openclaw=bool(getattr(args, "sync", False)),
+            agent_names=getattr(args, "agent", None),
+        )
     elif args.command == "auto":
-        cmd_auto(json_mode=bool(getattr(args, "json", False)))
+        cmd_auto(
+            json_mode=bool(getattr(args, "json", False)),
+            sync_openclaw=bool(getattr(args, "sync", False)),
+            agent_names=getattr(args, "agent", None),
+        )
     elif args.command == "compare":
         cmd_compare(args.left, args.right, json_mode=bool(getattr(args, "json", False)))
     elif args.command == "sync":
-        cmd_sync()
+        cmd_sync(
+            account_names=getattr(args, "names", None),
+            agent_names=getattr(args, "agent", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
     else:
         cmd_list(
             verbose=bool(getattr(args, "verbose", False)),
